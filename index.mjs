@@ -191,8 +191,12 @@ async function getState(name, pk) {
   const announcedApiNames = out.Item?.announcedApiNames ?? out.Item?.announced ?? [];
   const platinumAnnounced = !!out.Item?.platinumAnnounced;
 
-  log(name, `DynamoDB state loaded: exists=${exists} announcedCount=${announcedApiNames.length} platinumAnnounced=${platinumAnnounced}`);
-  return { exists, announcedApiNames, platinumAnnounced };
+  log(
+    name,
+    `DynamoDB state loaded: exists=${exists} announcedCount=${announcedApiNames.length} platinumAnnounced=${platinumAnnounced}`
+  );
+
+  return { exists, announcedApiNames, platinumAnnounced, priorItem: out.Item ?? null };
 }
 
 async function putStateItem(name, item) {
@@ -347,6 +351,38 @@ async function getRarityForApp({ name, appid }) {
   return map;
 }
 
+
+function setsEqual(aSet, bArr) {
+  if (!bArr) return false;
+  if (aSet.size !== bArr.length) return false;
+  for (const v of bArr) {
+    if (!aSet.has(v)) return false;
+  }
+  return true;
+}
+
+function shouldWriteState({ exists, priorItem, gameTitle, totalAchievements, unlockedCount, lockedCount, progressText, announcedSet, platinumFlag }) {
+  // Always write on first sight so the record exists.
+  if (!exists || !priorItem) return true;
+
+  // If any core fields changed, write.
+  if ((priorItem.gameTitle ?? null) !== (gameTitle ?? null)) return true;
+  if (Number(priorItem.totalAchievements ?? -1) !== Number(totalAchievements ?? -1)) return true;
+  if (Number(priorItem.unlockedCount ?? -1) !== Number(unlockedCount ?? -1)) return true;
+  if (Number(priorItem.lockedCount ?? -1) !== Number(lockedCount ?? -1)) return true;
+  if ((priorItem.progressText ?? null) !== (progressText ?? null)) return true;
+
+  // Announced set changed?
+  const priorAnnounced = priorItem.announcedApiNames ?? priorItem.announced ?? [];
+  if (!setsEqual(announcedSet, priorAnnounced)) return true;
+
+  // Platinum flag changed?
+  if (Boolean(priorItem.platinumAnnounced) !== Boolean(platinumFlag)) return true;
+
+  // No meaningful changes.
+  return false;
+}
+
 /* -------------------- main per-user processing -------------------- */
 
 async function processOneUser(user) {
@@ -386,17 +422,32 @@ async function processOneUser(user) {
   const lockedApiNames = playerAch.filter((a) => Number(a.achieved) === 0).map((a) => a.apiname);
   const unlockedApiNames = unlocked.map((a) => a.apiname);
 
-  // 2) Load DDB state, compute "toPost" BEFORE schema/rarity calls
+  // 2) Compute recent unlocks first; if none, skip DynamoDB entirely (no GetItem / no PutItem)
   const pk = `steam#${steamId}#app#${appid}`;
   const nowSec = Math.floor(Date.now() / 1000);
   const cutoff = nowSec - windowSeconds;
 
-  const { exists, announcedApiNames, platinumAnnounced } = await getState(name, pk);
-  let announcedSet = new Set(announcedApiNames);
-  let platinumFlag = platinumAnnounced;
-
   const unlockedRecent = unlocked.filter((a) => a.unlocktime > 0 && a.unlocktime >= cutoff);
   log(name, `Recent window: last ${windowSeconds}s. recentUnlocked=${unlockedRecent.length}`);
+
+  // We can still compute progress for logs/return without touching DynamoDB.
+  const unlockedCount = unlockedApiNames.length;
+  const lockedCount = lockedApiNames.length;
+  const totalFallback = unlockedCount + lockedCount;
+  let pctComplete = percent(unlockedCount, totalFallback);
+  let progressText = `${unlockedCount}/${totalFallback} (${pctComplete}%)`;
+  log(name, `Progress: ${progressText}`);
+
+  if (unlockedRecent.length === 0) {
+    log(name, "No recent unlocks; skipping DynamoDB GetItem/PutItem.");
+    log(name, "User processing complete");
+    return { ok: true, name, posted: 0, appid, gameTitle: resolvedGameTitle, progressText, platinum: false };
+  }
+
+  // Only now hit DynamoDB since there are recent unlocks
+  const { exists, announcedApiNames, platinumAnnounced, priorItem } = await getState(name, pk);
+  let announcedSet = new Set(announcedApiNames);
+  let platinumFlag = platinumAnnounced;
 
   if (!exists) {
     log(name, "First time seeing this game. Bootstrapping 'seen' achievements.");
@@ -430,17 +481,18 @@ async function processOneUser(user) {
     }
   }
 
-  // 4) Even if we didn't fetch schema, we still want progress counts.
-  // If totalCount unknown, fall back to unlocked+locked from player list (it matches total achievements in player response)
-  const unlockedCount = unlockedApiNames.length;
-  const lockedCount = lockedApiNames.length;
-
-  const totalFallback = unlockedCount + lockedCount;
+  // 4) Determine totals. Prefer schema totalCount if we fetched it; otherwise fall back to unlocked+locked.
   const totalAchievements = (typeof totalCount === "number" ? totalCount : totalFallback);
 
-  const pctComplete = percent(unlockedCount, totalAchievements);
-  const progressText = `${unlockedCount}/${totalAchievements} (${pctComplete}%)`;
-  log(name, `Progress: ${progressText}`);
+  // Recompute percent based on the chosen total
+  const pctCompleteFinal = percent(unlockedCount, totalAchievements);
+  const progressTextFinal = `${unlockedCount}/${totalAchievements} (${pctCompleteFinal}%)`;
+
+  // If schema total differs from fallback, update values used in embeds/state
+  pctComplete = pctCompleteFinal;
+  progressText = progressTextFinal;
+
+  log(name, `Progress (final): ${progressText}`);
 
   const isPlatinum = totalAchievements > 0 && unlockedCount === totalAchievements;
 
@@ -506,7 +558,7 @@ async function processOneUser(user) {
     platinumFlag = true;
   }
 
-  // 7) Persist rich DynamoDB record every run
+  // 7) Persist rich DynamoDB record every run, but only if there are changes
   const item = {
     PK: pk,
     name,
@@ -528,7 +580,23 @@ async function processOneUser(user) {
     updatedAt: nowSec,
   };
 
-  await putStateItem(name, item);
+  const needsWrite = shouldWriteState({
+    exists,
+    priorItem,
+    gameTitle,
+    totalAchievements,
+    unlockedCount,
+    lockedCount,
+    progressText,
+    announcedSet,
+    platinumFlag: !!platinumFlag,
+  });
+
+  if (needsWrite) {
+    await putStateItem(name, item);
+  } else {
+    log(name, "No DynamoDB changes detected; skipping PutItem.");
+  }
 
   log(name, "User processing complete");
   return { ok: true, name, posted: toPost.length, appid, gameTitle, progressText, platinum: isPlatinum };
