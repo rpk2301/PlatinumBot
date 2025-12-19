@@ -1,18 +1,28 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+} from "@aws-sdk/lib-dynamodb";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const {
-  USERS, 
+  USERS, // JSON string: [{"name":"Ricky","steamId":"7656..."}, ...]
   STEAM_API_KEY,
-  DISCORD_WEBHOOK_URL, 
-  DDB_TABLE,
+  DISCORD_WEBHOOK_URL, // default webhook if user doesn't provide one
+  DDB_TABLE,           // state table (per user+game)
   TIMEZONE = "America/New_York",
-  ACH_WINDOW_SECONDS = "900", //15min
-  CONCURRENCY = "5", 
-  PLATINUM_IMAGE_URL,
+  ACH_WINDOW_SECONDS = "900", // 15 minutes default
+  CONCURRENCY = "3",
+  PLATINUM_IMAGE_URL = "https://i.imgur.com/8mQe7pD.jpeg",
+
+  // Guard rail (bytes). DynamoDB item limit is 400KB; keep a buffer.
   DDB_ITEM_MAX_BYTES = "350000",
+
+  // Weekly leaderboard event logging (optional)
+  EVENTS_TABLE,          // e.g. "SteamAchievementEvents"
+  EVENT_TTL_DAYS = "120"
 } = process.env;
 
 const DEFAULT_WINDOW = Number(ACH_WINDOW_SECONDS) || 900;
@@ -27,7 +37,6 @@ mustEnv("USERS");
 mustEnv("STEAM_API_KEY");
 mustEnv("DISCORD_WEBHOOK_URL");
 mustEnv("DDB_TABLE");
-mustEnv("PLATINUM_IMAGE_URL")
 
 function parseUsers() {
   let parsed;
@@ -71,32 +80,85 @@ function formatLocalDateFromUnix(sec, tz) {
   return new Date(sec * 1000).toLocaleString("en-US", { timeZone: tz });
 }
 
-/**
- * byte-size estimator for DynamoDB item guardrail.
- */
+/* -------------------- Leaderboard Event Logging -------------------- */
+
+function isoWeekKey(dateUtc) {
+  const d = new Date(Date.UTC(dateUtc.getUTCFullYear(), dateUtc.getUTCMonth(), dateUtc.getUTCDate()));
+  const day = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, "0")}`;
+}
+
+async function recordAchievementEvent({
+  name,
+  steamId,
+  appid,
+  gameTitle,
+  achievementApiName,
+  achievementDisplayName,
+  rarityPercent,
+  unlockedAtSec,
+}) {
+  if (!EVENTS_TABLE) return;
+
+  const week = isoWeekKey(new Date(unlockedAtSec * 1000));
+  const pk = `week#${week}`;
+  const sk =
+    `user#${steamId}` +
+    `#t#${String(unlockedAtSec).padStart(10, "0")}` +
+    `#app#${appid}` +
+    `#ach#${achievementApiName}`;
+
+  const ttlDays = Number(EVENT_TTL_DAYS) || 120;
+  const ttl = Math.floor(Date.now() / 1000) + ttlDays * 86400;
+
+  const item = {
+    PK: pk,
+    SK: sk,
+    week,
+    name,
+    steamId,
+    appid,
+    gameTitle,
+    achievementApiName,
+    achievementDisplayName,
+    rarityPercent: Number.isFinite(rarityPercent) ? rarityPercent : null,
+    unlockedAtSec,
+    ttl,
+  };
+
+  try {
+    await ddb.send(new PutCommand({
+      TableName: EVENTS_TABLE,
+      Item: item,
+      ConditionExpression: "attribute_not_exists(PK) AND attribute_not_exists(SK)",
+    }));
+  } catch (e) {
+    const msg = e?.name || e?.message || String(e);
+    if (String(msg).includes("ConditionalCheckFailed")) return;
+    console.log(`[system] Failed to record event: ${msg}`);
+  }
+}
+
+/* -------------------- DynamoDB guardrail + state -------------------- */
+
 function approxUtf8Bytes(obj) {
   const s = JSON.stringify(obj);
   return Buffer.byteLength(s, "utf8");
 }
 
-/**
- * Guard rail: If item is getting too large, drop the biggest arrays and mark truncated.
- * We always keep announcedApiNames (needed for idempotency), plus counts + metadata.
- */
 function applyDdbSizeGuardrail(name, item) {
   const initialBytes = approxUtf8Bytes(item);
   if (initialBytes <= MAX_ITEM_BYTES) {
     return { item, truncated: false, bytes: initialBytes };
   }
 
-  log(
-    name,
-    `DynamoDB item nearing size limit: approxBytes=${initialBytes}. Truncating large arrays (limit=${MAX_ITEM_BYTES}).`
-  );
+  log(name, `⚠️ DynamoDB item nearing size limit: approxBytes=${initialBytes}. Truncating arrays (limit=${MAX_ITEM_BYTES}).`);
 
   const trimmed = {
     ...item,
-    // Drop biggest arrays first:
     unlockedApiNames: undefined,
     lockedApiNames: undefined,
     unannouncedUnlockedApiNames: undefined,
@@ -104,31 +166,22 @@ function applyDdbSizeGuardrail(name, item) {
     approxBytesBeforeTruncate: initialBytes,
   };
 
-  // Remove undefined keys (DynamoDBDocumentClient can ignore them, but i want this to be explicit)
-  // I might change this later tbh
   for (const k of Object.keys(trimmed)) {
     if (trimmed[k] === undefined) delete trimmed[k];
   }
 
   const finalBytes = approxUtf8Bytes(trimmed);
 
-  // If it's STILL too big, also drop announced list and keep only counts + flags.
   if (finalBytes > MAX_ITEM_BYTES) {
-    log(
-      name,
-      `🚨 Still too large after truncation: approxBytes=${finalBytes}. Dropping announcedApiNames as last resort (may repost).`
-    );
-
+    log(name, `🚨 Still too large after truncation: approxBytes=${finalBytes}. Dropping announcedApiNames as last resort (may repost).`);
     delete trimmed.announcedApiNames;
     trimmed.announcedDropped = true;
-
     const finalFinalBytes = approxUtf8Bytes(trimmed);
     return { item: trimmed, truncated: true, bytes: finalFinalBytes };
   }
 
   return { item: trimmed, truncated: true, bytes: finalBytes };
 }
-
 
 async function getState(name, pk) {
   log(name, `DynamoDB GetItem PK=${pk}`);
@@ -138,12 +191,8 @@ async function getState(name, pk) {
   const announcedApiNames = out.Item?.announcedApiNames ?? out.Item?.announced ?? [];
   const platinumAnnounced = !!out.Item?.platinumAnnounced;
 
-  log(
-    name,
-    `DynamoDB state loaded: exists=${exists} announcedCount=${announcedApiNames.length} platinumAnnounced=${platinumAnnounced}`
-  );
-
-  return { exists, announcedApiNames, platinumAnnounced, priorItem: out.Item || null };
+  log(name, `DynamoDB state loaded: exists=${exists} announcedCount=${announcedApiNames.length} platinumAnnounced=${platinumAnnounced}`);
+  return { exists, announcedApiNames, platinumAnnounced };
 }
 
 async function putStateItem(name, item) {
@@ -154,13 +203,10 @@ async function putStateItem(name, item) {
     `DynamoDB PutItem PK=${safeItem.PK} gameTitle="${safeItem.gameTitle}" progress=${safeItem.progressText} announcedCount=${safeItem.announcedApiNames?.length ?? 0} platinumAnnounced=${!!safeItem.platinumAnnounced} approxBytes=${bytes}${truncated ? " (TRUNCATED)" : ""}`
   );
 
-  await ddb.send(
-    new PutCommand({
-      TableName: DDB_TABLE,
-      Item: safeItem,
-    })
-  );
+  await ddb.send(new PutCommand({ TableName: DDB_TABLE, Item: safeItem }));
 }
+
+/* -------------------- Discord posting -------------------- */
 
 async function postDiscordPayload(name, webhookUrl, payload) {
   const res = await fetch(webhookUrl, {
@@ -177,40 +223,29 @@ async function postDiscordPayload(name, webhookUrl, payload) {
 }
 
 async function postDiscordEmbed(name, webhookUrl, embed) {
-  log(name, `Posting Discord embed: achievement="${embed?.fields?.[0]?.value ?? "unknown"}"`);
-
-  const payload = {
+  log(name, `Posting Discord embed: achievement="${embed?.fields?.find(f => f.name === "Achievement")?.value ?? "unknown"}"`);
+  await postDiscordPayload(name, webhookUrl, {
     username: `${name}'s Platinum Bot`,
     embeds: [embed],
-  };
-
-  await postDiscordPayload(name, webhookUrl, payload);
+  });
   log(name, "Discord post succeeded");
 }
 
 async function postPlatinumCongrats(name, webhookUrl, gameTitle) {
   const msg = `@everyone Congratulations on your shiny new ${gameTitle} platinum, ${name}! 🏆✨`;
-
-  const payload = {
+  await postDiscordPayload(name, webhookUrl, {
     username: `${name}'s Platinum Bot`,
     content: msg,
-    embeds: PLATINUM_IMAGE_URL ? [{ image: { url: PLATINUM_IMAGE_URL } }] : [],
-  };
-
-  log(name, `Posting platinum celebration message for "${gameTitle}"`);
-  await postDiscordPayload(name, webhookUrl, payload);
+    embeds: PLATINUM_IMAGE_URL ? [{ thumbnail: { url: PLATINUM_IMAGE_URL } }] : [],
+  });
   log(name, "Platinum celebration post succeeded");
 }
 
-/**
- * Determine which game to track:
- * 1) If currently playing → use presence
- * 2) Else → most recently played
- */
+/* -------------------- Steam: game selection -------------------- */
+
 async function resolveTargetGame({ name, steamId }) {
   log(name, "Resolving current or last played game from Steam");
 
-  // Currently playing
   const summariesUrl =
     `https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/` +
     `?key=${encodeURIComponent(STEAM_API_KEY)}&steamids=${encodeURIComponent(steamId)}`;
@@ -226,7 +261,6 @@ async function resolveTargetGame({ name, steamId }) {
 
   log(name, "Not currently in-game. Checking recently played games.");
 
-  // Recently played
   const recentUrl =
     `https://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v0001/` +
     `?key=${encodeURIComponent(STEAM_API_KEY)}&steamid=${encodeURIComponent(steamId)}&count=1`;
@@ -244,8 +278,32 @@ async function resolveTargetGame({ name, steamId }) {
   return null;
 }
 
-// In-run cache for schema by appid
-const schemaCache = new Map(); // appid -> { schemaGameName, schemaByApi, totalCount }
+/* -------------------- Rarity helpers -------------------- */
+
+function rarityTier(pct) {
+  if (pct < 1) return "Legendary";
+  if (pct < 5) return "Epic";
+  if (pct < 20) return "Rare";
+  if (pct < 50) return "Uncommon";
+  return "Common";
+}
+
+function formatRarityLine(pct) {
+  return `🏆 Rarity: ${rarityTier(pct)} (${pct.toFixed(2)}% of players)`;
+}
+
+function rarityColor(pct) {
+  if (pct < 1) return 0xF1C40F;
+  if (pct < 5) return 0xE67E22;
+  if (pct < 20) return 0x9B59B6;
+  if (pct < 50) return 0x3498DB;
+  return 0x2ECC71;
+}
+
+/* -------------------- Lazy schema/rarity caches -------------------- */
+
+const schemaCache = new Map(); // appid -> { schemaByApi, totalCount, schemaGameName }
+const rarityCache = new Map(); // appid -> Map(apiname -> percent) OR null
 
 async function getSchemaForApp({ name, appid }) {
   if (schemaCache.has(appid)) return schemaCache.get(appid);
@@ -267,6 +325,30 @@ async function getSchemaForApp({ name, appid }) {
   return cached;
 }
 
+async function getRarityForApp({ name, appid }) {
+  if (rarityCache.has(appid)) return rarityCache.get(appid);
+
+  const url =
+    `https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v0002/` +
+    `?gameid=${encodeURIComponent(appid)}`;
+
+  log(name, `Fetching global achievement percentages (rarity) (appid=${appid})`);
+  const json = await steamGet(name, url);
+
+  const arr = json?.achievementpercentages?.achievements ?? [];
+  if (!Array.isArray(arr) || arr.length === 0) {
+    log(name, `No rarity data returned for appid=${appid}`);
+    rarityCache.set(appid, null);
+    return null;
+  }
+
+  const map = new Map(arr.map((x) => [x.name, Number(x.percent)]));
+  rarityCache.set(appid, map);
+  return map;
+}
+
+/* -------------------- main per-user processing -------------------- */
+
 async function processOneUser(user) {
   const name = user.name;
   const steamId = String(user.steamId).trim();
@@ -283,17 +365,11 @@ async function processOneUser(user) {
   }
 
   const { appid, gameTitle: resolvedGameTitle, source } = target;
-  log(name, `Checking Achievements for ${resolvedGameTitle} (appid=${appid}, source=${source})`);
+  log(name, `Selected game: ${resolvedGameTitle} (appid=${appid}, source=${source})`);
 
-  const { schemaGameName, schemaByApi, totalCount } = await getSchemaForApp({ name, appid });
+  const achievementsUrl = `https://steamcommunity.com/profiles/${steamId}/stats/${appid}/achievements/`;
 
-  // Prefer real title (presence/recent); schema is fallback only
-  const gameTitle = resolvedGameTitle || schemaGameName || `Steam App ${appid}`;
-  if (schemaGameName && schemaGameName.startsWith("ValveTestApp")) {
-    log(name, `Schema returned placeholder name "${schemaGameName}", using resolved name "${resolvedGameTitle}"`);
-  }
-
-  // Player achievements
+  // 1) Fetch player achievements FIRST (cheap-ish, and lets us decide whether we need schema/rarity)
   const playerUrl =
     `https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/` +
     `?appid=${encodeURIComponent(appid)}&key=${encodeURIComponent(STEAM_API_KEY)}&steamid=${encodeURIComponent(steamId)}`;
@@ -310,15 +386,7 @@ async function processOneUser(user) {
   const lockedApiNames = playerAch.filter((a) => Number(a.achieved) === 0).map((a) => a.apiname);
   const unlockedApiNames = unlocked.map((a) => a.apiname);
 
-  const unlockedCount = unlockedApiNames.length;
-  const lockedCount = lockedApiNames.length;
-
-  const pct = percent(unlockedCount, totalCount);
-  const progressText = `${unlockedCount}/${totalCount} (${pct}%)`;
-
-  log(name, `Progress: ${progressText}`);
-
-
+  // 2) Load DDB state, compute "toPost" BEFORE schema/rarity calls
   const pk = `steam#${steamId}#app#${appid}`;
   const nowSec = Math.floor(Date.now() / 1000);
   const cutoff = nowSec - windowSeconds;
@@ -327,61 +395,118 @@ async function processOneUser(user) {
   let announcedSet = new Set(announcedApiNames);
   let platinumFlag = platinumAnnounced;
 
-  // Filter only recent unlocks
   const unlockedRecent = unlocked.filter((a) => a.unlocktime > 0 && a.unlocktime >= cutoff);
   log(name, `Recent window: last ${windowSeconds}s. recentUnlocked=${unlockedRecent.length}`);
 
-  // First time seeing this game → prevent historical spam but still track state
   if (!exists) {
     log(name, "First time seeing this game. Bootstrapping 'seen' achievements.");
-    announcedSet = new Set(unlockedApiNames); // mark all unlocked history as "seen"
+    announcedSet = new Set(unlockedApiNames);
   }
 
-  // Achievements we will post now
   const toPost = exists
     ? unlockedRecent.filter((a) => !announcedSet.has(a.apiname))
     : unlockedRecent;
 
-  // Platinum detection
-  const isPlatinum = totalCount > 0 && unlockedCount === totalCount;
+  // 3) Lazy-fetch schema/rarity ONLY if posting
+  let schemaByApi = null;
+  let totalCount = null;
+  let rarityMap = null;
 
-  // Send achievement embeds
+  // Game title: prefer presence name; schema name only used if needed
+  let gameTitle = resolvedGameTitle;
+
+  if (toPost.length > 0) {
+    const schema = await getSchemaForApp({ name, appid });
+    schemaByApi = schema.schemaByApi;
+    totalCount = schema.totalCount;
+
+    // Only fetch rarity if posting (optional)
+    rarityMap = await getRarityForApp({ name, appid });
+
+    // If schema returns a better title and presence title is missing, use it.
+    if (!gameTitle) gameTitle = schema.schemaGameName || gameTitle;
+    if (schema.schemaGameName && schema.schemaGameName.startsWith("ValveTestApp")) {
+      log(name, `Schema placeholder "${schema.schemaGameName}", keeping resolved title "${resolvedGameTitle}"`);
+    }
+  }
+
+  // 4) Even if we didn't fetch schema, we still want progress counts.
+  // If totalCount unknown, fall back to unlocked+locked from player list (it matches total achievements in player response)
+  const unlockedCount = unlockedApiNames.length;
+  const lockedCount = lockedApiNames.length;
+
+  const totalFallback = unlockedCount + lockedCount;
+  const totalAchievements = (typeof totalCount === "number" ? totalCount : totalFallback);
+
+  const pctComplete = percent(unlockedCount, totalAchievements);
+  const progressText = `${unlockedCount}/${totalAchievements} (${pctComplete}%)`;
+  log(name, `Progress: ${progressText}`);
+
+  const isPlatinum = totalAchievements > 0 && unlockedCount === totalAchievements;
+
+  // 5) Post embeds if needed
   if (toPost.length === 0) {
     log(name, "No new recent achievements to post.");
   } else {
     log(name, `Found ${toPost.length} new recent achievement(s) to post`);
 
     for (const a of toPost) {
-      const meta = schemaByApi.get(a.apiname);
+      const meta = schemaByApi?.get(a.apiname);
       const achievementName = meta?.displayName ?? a.apiname;
       const achievementDesc = meta?.description ?? "Hidden Achievement";
       const iconUrl = meta?.icon ?? null;
 
+      let rarityPct = null;
+      if (rarityMap && rarityMap.has(a.apiname)) {
+        const v = rarityMap.get(a.apiname);
+        if (Number.isFinite(v)) rarityPct = v;
+      }
+
+      const embedColor = rarityPct === null ? 0xE74C3C : rarityColor(rarityPct);
+
+      const fields = [
+        { name: "Achievement", value: achievementName, inline: false },
+        { name: "Achievement Description:", value: achievementDesc, inline: false },
+        { name: "Unlocked On:", value: formatLocalDateFromUnix(a.unlocktime, tz), inline: false },
+        { name: `Total ${gameTitle} Progress:`, value: `${unlockedCount}/${totalAchievements} — ${pctComplete}%`, inline: false },
+      ];
+
+      if (rarityPct !== null) {
+        fields.push({ name: "Rarity", value: formatRarityLine(rarityPct), inline: false });
+      }
+
       const embed = {
-        color: 0xe74c3c,
-        author: { name: `${name}'s Platinum Bot` },
-        description: `**${name} unlocked a new achievement in ${gameTitle}, they are now ${pct}% complete.**`,
+        color: embedColor,
+        title: `${name} unlocked a new achievement in ${gameTitle}, they are now ${pctComplete}% complete.`,
+        url: achievementsUrl,
         ...(iconUrl ? { thumbnail: { url: iconUrl } } : {}),
-        fields: [
-          { name: `${name}'s Most Recent Achievement:`, value: achievementName, inline: false },
-          { name: "Achievement Description:", value: achievementDesc, inline: false },
-          { name: "Unlocked On:", value: formatLocalDateFromUnix(a.unlocktime, tz), inline: false },
-          { name: `Total ${gameTitle} Progress:`, value: `${unlockedCount}/${totalCount} — ${pct}%`, inline: false },
-        ],
-        url: `https://steamcommunity.com/profiles/${steamId}/stats/${appid}/achievements/`,
+        fields,
       };
 
       await postDiscordEmbed(name, webhookUrl, embed);
+
+      await recordAchievementEvent({
+        name,
+        steamId,
+        appid,
+        gameTitle,
+        achievementApiName: a.apiname,
+        achievementDisplayName: achievementName,
+        rarityPercent: rarityPct,
+        unlockedAtSec: a.unlocktime,
+      });
+
       announcedSet.add(a.apiname);
     }
   }
 
-  // Platinum celebration (only once) — only do it if we posted something this run
+  // 6) Platinum celebration (only once, only if we posted something this run)
   if (toPost.length > 0 && isPlatinum && !platinumFlag) {
     await postPlatinumCongrats(name, webhookUrl, gameTitle);
     platinumFlag = true;
   }
 
+  // 7) Persist rich DynamoDB record every run
   const item = {
     PK: pk,
     name,
@@ -389,12 +514,11 @@ async function processOneUser(user) {
     appid,
     gameTitle,
 
-    totalAchievements: totalCount,
+    totalAchievements,
     unlockedCount,
     lockedCount,
     progressText,
 
-    // These can be large; guardrail will drop them if needed:
     unlockedApiNames,
     lockedApiNames,
     announcedApiNames: Array.from(announcedSet),
@@ -407,16 +531,10 @@ async function processOneUser(user) {
   await putStateItem(name, item);
 
   log(name, "User processing complete");
-  return {
-    ok: true,
-    name,
-    posted: toPost.length,
-    appid,
-    gameTitle,
-    progressText,
-    platinum: isPlatinum,
-  };
+  return { ok: true, name, posted: toPost.length, appid, gameTitle, progressText, platinum: isPlatinum };
 }
+
+/* -------------------- concurrency runner -------------------- */
 
 async function runWithConcurrency(items, worker, concurrency) {
   const results = new Array(items.length);
@@ -439,10 +557,12 @@ async function runWithConcurrency(items, worker, concurrency) {
   return results;
 }
 
+/* -------------------- Lambda handler -------------------- */
+
 export async function handler() {
   const users = parseUsers();
   console.log(
-    `[system] Starting run for ${users.length} user(s). Concurrency=${MAX_CONCURRENCY}. DDB_ITEM_MAX_BYTES=${MAX_ITEM_BYTES}`
+    `[system] Starting run for ${users.length} user(s). Concurrency=${MAX_CONCURRENCY}. DDB_ITEM_MAX_BYTES=${MAX_ITEM_BYTES}. EVENTS_TABLE=${EVENTS_TABLE || "(disabled)"}`
   );
 
   const results = await runWithConcurrency(users, processOneUser, MAX_CONCURRENCY);
